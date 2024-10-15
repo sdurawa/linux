@@ -972,7 +972,9 @@ static void vmd_bus_enumeration(struct pci_bus *bus, unsigned long features)
 	vmd_acpi_begin();
 
 	pci_scan_child_bus(bus);
-	vmd_domain_reset(vmd_from_bus(bus));
+
+	if (bus->primary == 0)
+		vmd_domain_reset(vmd_from_bus(bus));
 
 	/*
 	 * When Intel VMD is enabled, the OS does not discover the Root Ports
@@ -1163,6 +1165,7 @@ static int vmd_enable_domain(struct vmd_dev *vmd, unsigned long features)
 	}
 
 	vmd_bus_enumeration(vmd->bus, features);
+	vmd_bus_enumeration(vmd->bus_pch, features);
 
 	return 0;
 }
