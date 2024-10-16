@@ -817,8 +817,6 @@ static int vmd_pm_enable_quirk(struct pci_dev *pdev, void *userdata)
 static void vmd_configure_cfgbar(struct vmd_dev *vmd)
 {
 	struct resource *res;
-	u16 pch_bus_range = 0;
-	u16 ioc_bus_range = 0;
 
 	res = &vmd->dev->resource[VMD_CFGBAR];
 	vmd->resources[0] = (struct resource){
@@ -827,140 +825,44 @@ static void vmd_configure_cfgbar(struct vmd_dev *vmd)
 		.end = vmd->busn_start + (resource_size(res) >> 20) - 1,
 		.flags = IORESOURCE_BUS | IORESOURCE_PCI_FIXED,
 	};
-
-	if (vmd_has_pch_rootbus(vmd)) {
-		pci_read_config_word(vmd->dev, PCI_REG_BUSRANGE0,
-				     &ioc_bus_range);
-		pci_read_config_word(vmd->dev, PCI_REG_BUSRANGE1,
-				     &pch_bus_range);
-
-		vmd->resources[3] = (struct resource){
-			.name = "VMD CFGBAR PCH",
-			.start = VMD_ROOTBUS_RANGE_START(pch_bus_range),
-			.end = VMD_ROOTBUS_RANGE_END(pch_bus_range),
-			.flags = IORESOURCE_BUS | IORESOURCE_PCI_FIXED,
-			.parent = &vmd->resources[0],
-		};
-
-		/*
-		 * Update first cfgbar range (IOC) with value stored
-		 * in PCI_REG_BUSRANGE0
-		 */
-		vmd->resources[0].start =
-			VMD_ROOTBUS_RANGE_START(ioc_bus_range);
-		vmd->resources[0].end = VMD_ROOTBUS_RANGE_END(ioc_bus_range);
-	}
 }
 
-/*
- * If the window is below 4GB, clear IORESOURCE_MEM_64 so we can
- * put 32-bit resources in the window.
- *
- * There's no hardware reason why a 64-bit window *couldn't*
- * contain a 32-bit resource, but pbus_size_mem() computes the
- * bridge window size assuming a 64-bit window will contain no
- * 32-bit resources.  __pci_assign_resource() enforces that
- * artificial restriction to make sure everything will fit.
- *
- * The only way we could use a 64-bit non-prefetchable MEMBAR is
- * if its address is <4GB so that we can convert it to a 32-bit
- * resource.  To be visible to the host OS, all VMD endpoints must
- * be initially configured by platform BIOS, which includes setting
- * up these resources.  We can assume the device is configured
- * according to the platform needs.
- */
-static void vmd_configure_membar1(struct vmd_dev *vmd)
+static void vmd_configure_membar(struct vmd_dev *vmd,
+				 u8 membar_number, u8 resource_number,
+				 resource_size_t start_offset,
+				 resource_size_t end_offset,
+				 struct resource *parent)
 {
 	struct resource *res;
 	u32 upper_bits;
 	unsigned long flags;
-	u32 vmd_enh_membar1_offset = 0;
+	char name[16];
 
-	res = &vmd->dev->resource[VMD_MEMBAR1];
+	res = &vmd->dev->resource[membar_number];
 	upper_bits = upper_32_bits(res->end);
 	flags = res->flags & ~IORESOURCE_SIZEALIGN;
 	if (!upper_bits)
 		flags &= ~IORESOURCE_MEM_64;
-	vmd->resources[1] = (struct resource){
-		.name = "VMD MEMBAR1",
-		.start = res->start,
-		.end = res->end,
+
+	snprintf(name, sizeof(name), "VMD MEMBAR%d", membar_number/2);
+
+	if (!parent)
+		parent = res;
+
+	vmd->resources[resource_number] = (struct resource){
+		.name = name,
+		.start = res->start + start_offset,
+		.end = res->end - end_offset,
 		.flags = flags,
-		.parent = res,
+		.parent = parent,
 	};
-
-	if (vmd_has_pch_rootbus(vmd)) {
-		pci_read_config_dword(vmd->dev, PCI_MEMBAR1_OFFSET,
-				      &vmd_enh_membar1_offset);
-
-		vmd->resources[4] = (struct resource){
-			.name = "VMD MEMBAR1 PCH",
-			.start = res->start + vmd_enh_membar1_offset,
-			.end = res->end,
-			.flags = flags,
-			.parent = &vmd->resources[1],
-		};
-
-		/*
-		 * Update first MEMBAR1 range (IOC), memory start does not
-		 * change, memory end is one less than the offset stored
-		 * in PCI_MEMBAR1_OFFSET.
-		 */
-		vmd->resources[1].end = res->start + vmd_enh_membar1_offset - 1;
-	}
 }
 
-/*
- * Align resource information the same as for vmd_configure_membar1
- * function.
- */
-static void vmd_configure_membar2(struct vmd_dev *vmd,
-				  resource_size_t membar2_offset)
+static void vmd_configure_membar1_membar2(struct vmd_dev *vmd,
+					  resource_size_t membar2_offset)
 {
-	struct resource *res;
-	u32 upper_bits, reg;
-	unsigned long flags;
-	u64 vmd_enh_membar2_offset = 0;
-
-	res = &vmd->dev->resource[VMD_MEMBAR2];
-	upper_bits = upper_32_bits(res->end);
-	flags = res->flags & ~IORESOURCE_SIZEALIGN;
-
-	if (!upper_bits)
-		flags &= ~IORESOURCE_MEM_64;
-
-	vmd->resources[2] = (struct resource){
-		.name = "VMD MEMBAR2",
-		.start = res->start + membar2_offset,
-		.end = res->end,
-		.flags = flags,
-		.parent = res,
-	};
-
-	if (vmd_has_pch_rootbus(vmd)) {
-		pci_read_config_dword(vmd->dev, PCI_MEMBAR2_OFFSET1, &reg);
-		vmd_enh_membar2_offset = reg;
-		pci_read_config_dword(vmd->dev, PCI_MEMBAR2_OFFSET2, &reg);
-		vmd_enh_membar2_offset |= (u64)reg << 32;
-
-		vmd->resources[5] = (struct resource){
-			.name = "VMD MEMBAR2 PCH",
-			.start = res->start + membar2_offset +
-				 vmd_enh_membar2_offset,
-			.end = res->end,
-			.flags = flags,
-			.parent = &vmd->resources[2],
-		};
-
-		/*
-		 * Update first MEMBAR2 range (IOC), memory start does not
-		 * change, memory end is one less than the offset stored
-		 * as a 64 bit value in PCI_MEMBAR2_OFFSET1 and
-		 * PCI_MEMBAR2_OFFSET2 registers.
-		 */
-		vmd->resources[2].end = res->start + vmd_enh_membar2_offset +
-				       membar2_offset - 1;
-	}
+	vmd_configure_membar(vmd, VMD_MEMBAR1, 1, 0, 0, NULL);
+	vmd_configure_membar(vmd, VMD_MEMBAR2, 2, membar2_offset, 0, NULL);
 }
 
 static void vmd_bus_enumeration(struct pci_bus *bus, unsigned long features)
@@ -972,9 +874,7 @@ static void vmd_bus_enumeration(struct pci_bus *bus, unsigned long features)
 	vmd_acpi_begin();
 
 	pci_scan_child_bus(bus);
-
-	if (bus->primary == 0)
-		vmd_domain_reset(vmd_from_bus(bus));
+	vmd_domain_reset(vmd_from_bus(bus));
 
 	/*
 	 * When Intel VMD is enabled, the OS does not discover the Root Ports
@@ -1013,50 +913,6 @@ static void vmd_bus_enumeration(struct pci_bus *bus, unsigned long features)
 	vmd_acpi_end();
 }
 
-static int vmd_create_pch_bus(struct vmd_dev *vmd, struct pci_sysdata *sd,
-			      resource_size_t *offset)
-{
-	LIST_HEAD(resources_pch);
-
-	pci_add_resource(&resources_pch, &vmd->resources[3]);
-	pci_add_resource_offset(&resources_pch, &vmd->resources[4],
-				offset[0]);
-	pci_add_resource_offset(&resources_pch, &vmd->resources[5],
-				offset[1]);
-
-	vmd->bus_pch =
-		pci_create_root_bus(&vmd->dev->dev, vmd->busn_start_pch,
-					&vmd_ops, sd, &resources_pch);
-
-	if (!vmd->bus_pch) {
-		pci_free_resource_list(&resources_pch);
-		vmd_remove_irq_domain(vmd);
-		return -ENODEV;
-	}
-
-	/*
-	 * VMD enhacement specific: pci_scan_bridge_extend() in probe.c
-	 * assigns setup as broken when primary != bus->number.
-	 * For PCH rootbus primary is 0x80 and bus->number is 0xE1,
-	 * bus number needs to be overwritten to the same value
-	 * as primary to pass pci_scan_bridge_extend()
-	 */
-	vmd->bus_pch->primary = PCI_VMD_PRIMARY_PCH_BUS;
-	vmd->bus_pch->number = PCI_VMD_PRIMARY_PCH_BUS;
-
-	vmd_copy_host_bridge_flags(
-		pci_find_host_bridge(vmd->dev->bus),
-		to_pci_host_bridge(vmd->bus_pch->bridge));
-
-	if (vmd->irq_domain)
-		dev_set_msi_domain(&vmd->bus_pch->dev, vmd->irq_domain);
-	else
-		dev_set_msi_domain(&vmd->bus_pch->dev,
-				dev_get_msi_domain(&vmd->dev->dev));
-
-	return 0;
-}
-
 static int vmd_enable_domain(struct vmd_dev *vmd, unsigned long features)
 {
 	struct pci_sysdata *sd = &vmd->sysdata;
@@ -1093,8 +949,25 @@ static int vmd_enable_domain(struct vmd_dev *vmd, unsigned long features)
 	}
 
 	vmd_configure_cfgbar(vmd);
-	vmd_configure_membar1(vmd);
-	vmd_configure_membar2(vmd, membar2_offset);
+
+	/*
+	 * If the window is below 4GB, clear IORESOURCE_MEM_64 so we can
+	 * put 32-bit resources in the window.
+	 *
+	 * There's no hardware reason why a 64-bit window *couldn't*
+	 * contain a 32-bit resource, but pbus_size_mem() computes the
+	 * bridge window size assuming a 64-bit window will contain no
+	 * 32-bit resources.  __pci_assign_resource() enforces that
+	 * artificial restriction to make sure everything will fit.
+	 *
+	 * The only way we could use a 64-bit non-prefetchable MEMBAR is
+	 * if its address is <4GB so that we can convert it to a 32-bit
+	 * resource.  To be visible to the host OS, all VMD endpoints must
+	 * be initially configured by platform BIOS, which includes setting
+	 * up these resources.  We can assume the device is configured
+	 * according to the platform needs.
+	 */
+	vmd_configure_membar1_membar2(vmd, membar2_offset);
 
 	sd->vmd_dev = vmd->dev;
 	sd->domain = vmd_find_free_domain();
@@ -1155,17 +1028,7 @@ static int vmd_enable_domain(struct vmd_dev *vmd, unsigned long features)
 	WARN(sysfs_create_link(&vmd->dev->dev.kobj, &vmd->bus->dev.kobj,
 			       "domain"), "Can't create symlink to domain\n");
 
-	if (vmd_has_pch_rootbus(vmd)) {
-		ret = vmd_create_pch_bus(vmd, sd, offset);
-		if (ret) {
-			pci_err(vmd->dev, "Can't create PCH bus: %d\n", ret);
-			return ret;
-		}
-
-	}
-
 	vmd_bus_enumeration(vmd->bus, features);
-	vmd_bus_enumeration(vmd->bus_pch, features);
 
 	return 0;
 }
