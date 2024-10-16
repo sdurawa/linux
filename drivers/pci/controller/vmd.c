@@ -23,6 +23,8 @@
 #define VMD_MEMBAR1	2
 #define VMD_MEMBAR2	4
 
+#define VMD_ROOTBUS_SIZE 2
+
 #define PCI_REG_VMCAP		0x40
 #define BUS_RESTRICT_CAP(vmcap)	(vmcap & 0x1)
 #define PCI_REG_VMCONFIG	0x44
@@ -42,6 +44,20 @@
 
 #define MB2_SHADOW_OFFSET	0x2000
 #define MB2_SHADOW_SIZE		16
+
+enum vmd_resources {
+	VMD_RESOURCE_CFGBAR,
+	VMD_RESOURCE_MEMBAR1,
+	VMD_RESOURCE_MEMBAR2,
+	VMD_RESOURCE_PCH_CFGBAR,
+	VMD_RESOURCE_PCH_MEMBAR1,
+	VMD_RESOURCE_PCH_MEMBAR2
+};
+
+enum vmd_rootbus {
+	VMD_ROOTBUS0,
+	VMD_ROOTBUS1
+};
 
 enum vmd_features {
 	/*
@@ -85,8 +101,8 @@ enum vmd_features {
 	VMD_FEAT_BIOS_PM_QUIRK		= (1 << 5),
 
 	/*
-	 * Some client VMD devices have their VMD rootports connected to both
-	 * IOC and PCH rootbus.
+	 * Starting from Intel Arrow Lake, VMD devices have their VMD rootports
+	 * connected to CPU IOC and PCH rootbuses.
 	 */
 	VMD_FEAT_HAS_PCH_ROOTBUS	= (1 << 6)
 };
@@ -150,9 +166,8 @@ struct vmd_dev {
 	struct pci_sysdata	sysdata;
 	struct resource		resources[6];
 	struct irq_domain	*irq_domain;
-	struct pci_bus		*bus;
-	struct pci_bus		*bus_pch;
-	u8			busn_start;
+	struct pci_bus		*bus[VMD_ROOTBUS_SIZE];
+	u8			busn_start[VMD_ROOTBUS_SIZE];
 	u8			first_vec;
 	char			*name;
 	int			instance;
@@ -384,24 +399,25 @@ static void vmd_remove_irq_domain(struct vmd_dev *vmd)
 
 static inline u8 vmd_has_pch_rootbus(struct vmd_dev *vmd)
 {
-	return vmd->busn_start_pch != 0;
+	return vmd->busn_start[VMD_ROOTBUS1] != 0;
 }
 
 static void __iomem *vmd_cfg_addr(struct vmd_dev *vmd, struct pci_bus *bus,
 				  unsigned int devfn, int reg, int len)
 {
-	unsigned int busnr_ecam = 0;
+	unsigned char bus_number = 0;
 
 	/*
 	 * VMD enhacement specific: for PCH rootbus, bus number is set to
 	 * PCI_VMD_PRIMARY_PCH_BUS but original value is 0xE1 which is stored
-	 * in vmd->busn_start_pch.
+	 * in vmd->busn_start[VMD_ROOTBUS1].
 	 */
 	if (vmd_has_pch_rootbus(vmd) && bus->number == PCI_VMD_PRIMARY_PCH_BUS)
-		busnr_ecam = vmd->busn_start_pch - vmd->busn_start;
+		bus_number = vmd->busn_start[VMD_ROOTBUS1];
 	else
-		busnr_ecam = bus->number - vmd->busn_start;
+		bus_number = bus->number;
 
+	unsigned int busnr_ecam = bus_number - vmd->busn_start[VMD_ROOTBUS0];
 	u32 offset = PCIE_ECAM_OFFSET(busnr_ecam, devfn, reg);
 
 	if (offset + len >= resource_size(&vmd->dev->resource[VMD_CFGBAR]))
@@ -678,13 +694,26 @@ static int vmd_get_bus_number_start(struct vmd_dev *vmd, unsigned long features)
 
 		switch (BUS_RESTRICT_CFG(reg)) {
 		case 0:
-			vmd->busn_start = 0;
+			vmd->busn_start[VMD_ROOTBUS0] = 0;
 			break;
 		case 1:
-			vmd->busn_start = 128;
+			vmd->busn_start[VMD_ROOTBUS0] = 128;
 			break;
 		case 2:
-			vmd->busn_start = 224;
+			vmd->busn_start[VMD_ROOTBUS0] = 224;
+			break;
+		case 3:
+			if (features & VMD_FEAT_HAS_PCH_ROOTBUS) {
+				/* IOC start bus */
+				vmd->busn_start[VMD_ROOTBUS0] = 224;
+				/* PCH start bus */
+				vmd->busn_start[VMD_ROOTBUS1] = 225;
+			} else {
+				pci_err(dev,
+					"Unknown Bus Offset Setting (%d)\n",
+					BUS_RESTRICT_CFG(reg));
+				return -ENODEV;
+			}
 			break;
 		case 3:
 			if (features & VMD_FEAT_HAS_PCH_ROOTBUS) {
@@ -817,14 +846,42 @@ static int vmd_pm_enable_quirk(struct pci_dev *pdev, void *userdata)
 static void vmd_configure_cfgbar(struct vmd_dev *vmd)
 {
 	struct resource *res;
+	u16 ioc_bus_range = 0;
+	u16 pch_bus_range = 0;
 
 	res = &vmd->dev->resource[VMD_CFGBAR];
-	vmd->resources[0] = (struct resource){
+	vmd->resources[VMD_RESOURCE_CFGBAR] = (struct resource){
 		.name = "VMD CFGBAR",
-		.start = vmd->busn_start,
-		.end = vmd->busn_start + (resource_size(res) >> 20) - 1,
+		.start = vmd->busn_start[VMD_ROOTBUS0],
+		.end = vmd->busn_start[VMD_ROOTBUS0] +
+		       (resource_size(res) >> 20) - 1,
 		.flags = IORESOURCE_BUS | IORESOURCE_PCI_FIXED,
 	};
+
+	if (vmd_has_pch_rootbus(vmd)) {
+		pci_read_config_word(vmd->dev, PCI_REG_BUSRANGE0,
+				     &ioc_bus_range);
+		pci_read_config_word(vmd->dev, PCI_REG_BUSRANGE1,
+				     &pch_bus_range);
+
+		/*
+		 * Resize CPU IOC CFGBAR range to make space for PCH owned
+		 * devices by adjusting range end with value stored in
+		 * PCI_REG_BUSRANGE0 register.
+		 */
+		vmd->resources[VMD_RESOURCE_CFGBAR].start =
+			VMD_ROOTBUS_RANGE_START(ioc_bus_range);
+		vmd->resources[VMD_RESOURCE_CFGBAR].end =
+			VMD_ROOTBUS_RANGE_END(ioc_bus_range);
+
+		vmd->resources[VMD_RESOURCE_PCH_CFGBAR] = (struct resource){
+			.name = "VMD CFGBAR PCH",
+			.start = VMD_ROOTBUS_RANGE_START(pch_bus_range),
+			.end = VMD_ROOTBUS_RANGE_END(pch_bus_range),
+			.flags = IORESOURCE_BUS | IORESOURCE_PCI_FIXED,
+			.parent = &vmd->resources[VMD_RESOURCE_CFGBAR],
+		};
+	}
 }
 
 static void vmd_configure_membar(struct vmd_dev *vmd,
@@ -849,6 +906,9 @@ static void vmd_configure_membar(struct vmd_dev *vmd,
 	if (!parent)
 		parent = res;
 
+	if (resource_number > VMD_RESOURCE_MEMBAR2)
+		strncat(name, " PCH", 4);
+
 	vmd->resources[resource_number] = (struct resource){
 		.name = name,
 		.start = res->start + start_offset,
@@ -861,8 +921,43 @@ static void vmd_configure_membar(struct vmd_dev *vmd,
 static void vmd_configure_membar1_membar2(struct vmd_dev *vmd,
 					  resource_size_t membar2_offset)
 {
-	vmd_configure_membar(vmd, VMD_MEMBAR1, 1, 0, 0, NULL);
-	vmd_configure_membar(vmd, VMD_MEMBAR2, 2, membar2_offset, 0, NULL);
+	vmd_configure_membar(vmd, VMD_MEMBAR1, VMD_RESOURCE_MEMBAR1, 0, 0,
+			     NULL);
+	vmd_configure_membar(vmd, VMD_MEMBAR2, VMD_RESOURCE_MEMBAR2,
+			     membar2_offset, 0, NULL);
+
+	if (vmd_has_pch_rootbus(vmd)) {
+		u32 pch_membar1_offset = 0;
+		u64 pch_membar2_offset = 0;
+		u32 reg;
+
+		pci_read_config_dword(vmd->dev, PCI_MEMBAR1_OFFSET,
+				      &pch_membar1_offset);
+
+		pci_read_config_dword(vmd->dev, PCI_MEMBAR2_OFFSET1, &reg);
+		pch_membar2_offset = reg;
+
+		pci_read_config_dword(vmd->dev, PCI_MEMBAR2_OFFSET2, &reg);
+		pch_membar2_offset |= (u64)reg << 32;
+
+		/*
+		 * Resize CPU IOC MEMBAR1 and MEMBAR2 ranges to make space
+		 * for PCH owned devices by adjusting range end with values
+		 * stored in PCI_MEMBAR1_OFFSET and PCI_MEMBAR2_OFFSET registers
+		 */
+		vmd_configure_membar(vmd, VMD_MEMBAR1, VMD_RESOURCE_MEMBAR1, 0,
+				     pch_membar1_offset, NULL);
+		vmd_configure_membar(vmd, VMD_MEMBAR2, VMD_RESOURCE_MEMBAR2,
+				     membar2_offset,
+				     pch_membar2_offset - membar2_offset, NULL);
+
+		vmd_configure_membar(vmd, VMD_MEMBAR1, VMD_RESOURCE_PCH_MEMBAR1,
+				     pch_membar1_offset, 0,
+				     &vmd->resources[VMD_RESOURCE_MEMBAR1]);
+		vmd_configure_membar(vmd, VMD_MEMBAR2, VMD_RESOURCE_PCH_MEMBAR2,
+				     membar2_offset + pch_membar2_offset, 0,
+				     &vmd->resources[VMD_RESOURCE_MEMBAR2]);
+	}
 }
 
 static void vmd_bus_enumeration(struct pci_bus *bus, unsigned long features)
@@ -874,7 +969,9 @@ static void vmd_bus_enumeration(struct pci_bus *bus, unsigned long features)
 	vmd_acpi_begin();
 
 	pci_scan_child_bus(bus);
-	vmd_domain_reset(vmd_from_bus(bus));
+
+	if (bus->primary == 0)
+		vmd_domain_reset(vmd_from_bus(bus));
 
 	/*
 	 * When Intel VMD is enabled, the OS does not discover the Root Ports
@@ -911,6 +1008,53 @@ static void vmd_bus_enumeration(struct pci_bus *bus, unsigned long features)
 	pci_bus_add_devices(bus);
 
 	vmd_acpi_end();
+}
+
+static int vmd_create_pch_bus(struct vmd_dev *vmd, struct pci_sysdata *sd,
+			      resource_size_t *offset)
+{
+	LIST_HEAD(resources_pch);
+
+	pci_add_resource(&resources_pch,
+			 &vmd->resources[VMD_RESOURCE_PCH_CFGBAR]);
+	pci_add_resource_offset(&resources_pch,
+				&vmd->resources[VMD_RESOURCE_PCH_MEMBAR1],
+				offset[0]);
+	pci_add_resource_offset(&resources_pch,
+				&vmd->resources[VMD_RESOURCE_PCH_MEMBAR2],
+				offset[1]);
+
+	vmd->bus[VMD_ROOTBUS1] =
+		pci_create_root_bus(&vmd->dev->dev, vmd->busn_start[VMD_ROOTBUS1],
+					&vmd_ops, sd, &resources_pch);
+
+	if (!vmd->bus[VMD_ROOTBUS1]) {
+		pci_free_resource_list(&resources_pch);
+		vmd_remove_irq_domain(vmd);
+		return -ENODEV;
+	}
+
+	/*
+	 * This is a workaround for pci_scan_bridge_extend() code.
+	 * It assigns setup as broken when primary != bus->number and
+	 * for PCH rootbus primary is not "hard-wired to 0".
+	 * To avoid this, vmd->bus[VMD_ROOTBUS1]->number and
+	 * vmd->bus[VMD_ROOTBUS1]->primary are updated to same value.
+	 */
+	vmd->bus[VMD_ROOTBUS1]->primary = PCI_VMD_PRIMARY_PCH_BUS;
+	vmd->bus[VMD_ROOTBUS1]->number = PCI_VMD_PRIMARY_PCH_BUS;
+
+	vmd_copy_host_bridge_flags(
+		pci_find_host_bridge(vmd->dev->bus),
+		to_pci_host_bridge(vmd->bus[VMD_ROOTBUS1]->bridge));
+
+	if (vmd->irq_domain)
+		dev_set_msi_domain(&vmd->bus[VMD_ROOTBUS1]->dev, vmd->irq_domain);
+	else
+		dev_set_msi_domain(&vmd->bus[VMD_ROOTBUS1]->dev,
+				dev_get_msi_domain(&vmd->dev->dev));
+
+	return 0;
 }
 
 static int vmd_enable_domain(struct vmd_dev *vmd, unsigned long features)
@@ -1003,32 +1147,48 @@ static int vmd_enable_domain(struct vmd_dev *vmd, unsigned long features)
 		vmd_set_msi_remapping(vmd, false);
 	}
 
-	pci_add_resource(&resources, &vmd->resources[0]);
-	pci_add_resource_offset(&resources, &vmd->resources[1], offset[0]);
-	pci_add_resource_offset(&resources, &vmd->resources[2], offset[1]);
+	pci_add_resource(&resources, &vmd->resources[VMD_RESOURCE_CFGBAR]);
+	pci_add_resource_offset(
+		&resources, &vmd->resources[VMD_RESOURCE_MEMBAR1], offset[0]);
+	pci_add_resource_offset(
+		&resources, &vmd->resources[VMD_RESOURCE_MEMBAR2], offset[1]);
 
-	vmd->bus = pci_create_root_bus(&vmd->dev->dev, vmd->busn_start,
-				       &vmd_ops, sd, &resources);
-	if (!vmd->bus) {
+	vmd->bus[VMD_ROOTBUS0] = pci_create_root_bus(
+		&vmd->dev->dev, vmd->busn_start[VMD_ROOTBUS0], &vmd_ops, sd,
+		&resources);
+	if (!vmd->bus[VMD_ROOTBUS0]) {
 		pci_free_resource_list(&resources);
 		vmd_remove_irq_domain(vmd);
 		return -ENODEV;
 	}
 
-	vmd_copy_host_bridge_flags(pci_find_host_bridge(vmd->dev->bus),
-				   to_pci_host_bridge(vmd->bus->bridge));
+	vmd_copy_host_bridge_flags(
+		pci_find_host_bridge(vmd->dev->bus),
+		to_pci_host_bridge(vmd->bus[VMD_ROOTBUS0]->bridge));
 
 	vmd_attach_resources(vmd);
 	if (vmd->irq_domain)
-		dev_set_msi_domain(&vmd->bus->dev, vmd->irq_domain);
+		dev_set_msi_domain(&vmd->bus[VMD_ROOTBUS0]->dev,
+				   vmd->irq_domain);
 	else
-		dev_set_msi_domain(&vmd->bus->dev,
+		dev_set_msi_domain(&vmd->bus[VMD_ROOTBUS0]->dev,
 				   dev_get_msi_domain(&vmd->dev->dev));
 
-	WARN(sysfs_create_link(&vmd->dev->dev.kobj, &vmd->bus->dev.kobj,
-			       "domain"), "Can't create symlink to domain\n");
+	WARN(sysfs_create_link(&vmd->dev->dev.kobj,
+			       &vmd->bus[VMD_ROOTBUS0]->dev.kobj, "domain"),
+	     "Can't create symlink to domain\n");
 
-	vmd_bus_enumeration(vmd->bus, features);
+	vmd_bus_enumeration(vmd->bus[VMD_ROOTBUS0], features);
+
+	if (vmd_has_pch_rootbus(vmd)) {
+		ret = vmd_create_pch_bus(vmd, sd, offset);
+		if (ret) {
+			pci_err(vmd->dev, "Can't create PCH bus: %d\n", ret);
+			return ret;
+		}
+
+		vmd_bus_enumeration(vmd->bus[VMD_ROOTBUS1], features);
+	}
 
 	return 0;
 }
@@ -1105,12 +1265,12 @@ static void vmd_remove(struct pci_dev *dev)
 {
 	struct vmd_dev *vmd = pci_get_drvdata(dev);
 
-	pci_stop_root_bus(vmd->bus);
+	pci_stop_root_bus(vmd->bus[VMD_ROOTBUS0]);
 	sysfs_remove_link(&vmd->dev->dev.kobj, "domain");
-	pci_remove_root_bus(vmd->bus);
+	pci_remove_root_bus(vmd->bus[VMD_ROOTBUS0]);
 	if (vmd_has_pch_rootbus(vmd)) {
-		pci_stop_root_bus(vmd->bus_pch);
-		pci_remove_root_bus(vmd->bus_pch);
+		pci_stop_root_bus(vmd->bus[VMD_ROOTBUS1]);
+		pci_remove_root_bus(vmd->bus[VMD_ROOTBUS1]);
 	}
 	vmd_cleanup_srcu(vmd);
 	vmd_detach_resources(vmd);
