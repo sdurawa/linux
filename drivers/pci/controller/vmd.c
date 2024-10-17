@@ -23,8 +23,6 @@
 #define VMD_MEMBAR1	2
 #define VMD_MEMBAR2	4
 
-#define VMD_ROOTBUS_SIZE 2
-
 #define PCI_REG_VMCAP		0x40
 #define BUS_RESTRICT_CAP(vmcap)	(vmcap & 0x1)
 #define PCI_REG_VMCONFIG	0x44
@@ -45,18 +43,20 @@
 #define MB2_SHADOW_OFFSET	0x2000
 #define MB2_SHADOW_SIZE		16
 
-enum vmd_resources {
+enum vmd_resource {
 	VMD_RESOURCE_CFGBAR,
-	VMD_RESOURCE_MEMBAR1,
-	VMD_RESOURCE_MEMBAR2,
+	VMD_RESOURCE_MEMBAR_1,
+	VMD_RESOURCE_MEMBAR_2,
 	VMD_RESOURCE_PCH_CFGBAR,
-	VMD_RESOURCE_PCH_MEMBAR1,
-	VMD_RESOURCE_PCH_MEMBAR2
+	VMD_RESOURCE_PCH_MEMBAR_1,
+	VMD_RESOURCE_PCH_MEMBAR_2,
+	VMD_RESOURCE_COUNT
 };
 
 enum vmd_rootbus {
-	VMD_ROOTBUS0,
-	VMD_ROOTBUS1
+	VMD_ROOTBUS_0,
+	VMD_ROOTBUS_1,
+	VMD_ROOTBUS_COUNT
 };
 
 enum vmd_features {
@@ -164,14 +164,13 @@ struct vmd_dev {
 	struct vmd_irq_list	*irqs;
 
 	struct pci_sysdata	sysdata;
-	struct resource		resources[6];
+	struct resource		resources[VMD_RESOURCE_COUNT];
 	struct irq_domain	*irq_domain;
-	struct pci_bus		*bus[VMD_ROOTBUS_SIZE];
-	u8			busn_start[VMD_ROOTBUS_SIZE];
+	struct pci_bus		*bus[VMD_ROOTBUS_COUNT];
+	u8			busn_start[VMD_ROOTBUS_COUNT];
 	u8			first_vec;
 	char			*name;
 	int			instance;
-	u8			busn_start_pch;
 };
 
 static inline struct vmd_dev *vmd_from_bus(struct pci_bus *bus)
@@ -399,26 +398,26 @@ static void vmd_remove_irq_domain(struct vmd_dev *vmd)
 
 static inline u8 vmd_has_pch_rootbus(struct vmd_dev *vmd)
 {
-	return vmd->busn_start[VMD_ROOTBUS1] != 0;
+	return vmd->busn_start[VMD_ROOTBUS_1] != 0;
 }
 
 static void __iomem *vmd_cfg_addr(struct vmd_dev *vmd, struct pci_bus *bus,
 				  unsigned int devfn, int reg, int len)
 {
-	unsigned char bus_number = 0;
+	unsigned char bus_number;
+	unsigned int busnr_ecam;
+	u32 offset;
 
 	/*
-	 * VMD enhacement specific: for PCH rootbus, bus number is set to
-	 * PCI_VMD_PRIMARY_PCH_BUS but original value is 0xE1 which is stored
-	 * in vmd->busn_start[VMD_ROOTBUS1].
+	 * VMD WA: for PCH rootbus, bus number is set to PCI_VMD_PRIMARY_PCH_BUS
+	 * (see comment in vmd_create_pch_bus()) but original value is 0xE1
+	 * which is stored in vmd->busn_start[VMD_ROOTBUS_1].
 	 */
-	if (vmd_has_pch_rootbus(vmd) && bus->number == PCI_VMD_PRIMARY_PCH_BUS)
-		bus_number = vmd->busn_start[VMD_ROOTBUS1];
-	else
-		bus_number = bus->number;
+	bus_number = (bus->number == PCI_VMD_PRIMARY_PCH_BUS) ?
+			     vmd->busn_start[VMD_ROOTBUS_1] : bus->number;
 
-	unsigned int busnr_ecam = bus_number - vmd->busn_start[VMD_ROOTBUS0];
-	u32 offset = PCIE_ECAM_OFFSET(busnr_ecam, devfn, reg);
+	busnr_ecam = bus_number - vmd->busn_start[VMD_ROOTBUS_0];
+	offset = PCIE_ECAM_OFFSET(busnr_ecam, devfn, reg);
 
 	if (offset + len >= resource_size(&vmd->dev->resource[VMD_CFGBAR]))
 		return NULL;
@@ -694,38 +693,27 @@ static int vmd_get_bus_number_start(struct vmd_dev *vmd, unsigned long features)
 
 		switch (BUS_RESTRICT_CFG(reg)) {
 		case 0:
-			vmd->busn_start[VMD_ROOTBUS0] = 0;
+			vmd->busn_start[VMD_ROOTBUS_0] = 0;
 			break;
 		case 1:
-			vmd->busn_start[VMD_ROOTBUS0] = 128;
+			vmd->busn_start[VMD_ROOTBUS_0] = 128;
 			break;
 		case 2:
-			vmd->busn_start[VMD_ROOTBUS0] = 224;
+			vmd->busn_start[VMD_ROOTBUS_0] = 224;
 			break;
 		case 3:
 			if (features & VMD_FEAT_HAS_PCH_ROOTBUS) {
 				/* IOC start bus */
-				vmd->busn_start[VMD_ROOTBUS0] = 224;
+				vmd->busn_start[VMD_ROOTBUS_0] = 224;
 				/* PCH start bus */
-				vmd->busn_start[VMD_ROOTBUS1] = 225;
+				vmd->busn_start[VMD_ROOTBUS_1] = 225;
 			} else {
 				pci_err(dev,
-					"Unknown Bus Offset Setting (%d)\n",
+					"VMD Bus Restriction detected type %d,",
 					BUS_RESTRICT_CFG(reg));
-				return -ENODEV;
-			}
-			break;
-		case 3:
-			if (features & VMD_FEAT_HAS_PCH_ROOTBUS) {
-				/* IOC start bus */
-				vmd->busn_start = 224;
-				/* PCH start bus */
-				vmd->busn_start_pch = 225;
-			} else {
 				pci_err(dev,
-					"Unknown Bus Offset Setting (%d)\n",
-					BUS_RESTRICT_CFG(reg));
-				return -ENODEV;
+					"but PCH Rootbus is not supported, aborting.\n");
+				return -ENXIO;
 			}
 			break;
 		default:
@@ -852,8 +840,8 @@ static void vmd_configure_cfgbar(struct vmd_dev *vmd)
 	res = &vmd->dev->resource[VMD_CFGBAR];
 	vmd->resources[VMD_RESOURCE_CFGBAR] = (struct resource){
 		.name = "VMD CFGBAR",
-		.start = vmd->busn_start[VMD_ROOTBUS0],
-		.end = vmd->busn_start[VMD_ROOTBUS0] +
+		.start = vmd->busn_start[VMD_ROOTBUS_0],
+		.end = vmd->busn_start[VMD_ROOTBUS_0] +
 		       (resource_size(res) >> 20) - 1,
 		.flags = IORESOURCE_BUS | IORESOURCE_PCI_FIXED,
 	};
@@ -884,9 +872,21 @@ static void vmd_configure_cfgbar(struct vmd_dev *vmd)
 	}
 }
 
+/**
+ * vmd_configure_membar - Configure VMD MemBAR register, which points
+ * to MMIO address assigned by the OS or BIOS.
+ * @vmd: the VMD device
+ * @resource_number: resource buffer number to be filled in
+ * @membar_number: type of the MemBAR
+ * @start_offset: 4K aligned offset applied to start of VMD’s MEMBAR MMIO space
+ * @end_offset: 4K aligned offset applied to end of VMD’s MEMBAR MMIO space
+ * @parent: parent resource assigned to resource to be filled in
+ *
+ * Function fills resource buffer inside the VMD structure.
+ */
 static void vmd_configure_membar(struct vmd_dev *vmd,
-				 u8 membar_number, u8 resource_number,
-				 resource_size_t start_offset,
+				 enum vmd_resource resource_number,
+				 u8 membar_number, resource_size_t start_offset,
 				 resource_size_t end_offset,
 				 struct resource *parent)
 {
@@ -906,7 +906,7 @@ static void vmd_configure_membar(struct vmd_dev *vmd,
 	if (!parent)
 		parent = res;
 
-	if (resource_number > VMD_RESOURCE_MEMBAR2)
+	if (resource_number > VMD_RESOURCE_MEMBAR_2)
 		strncat(name, " PCH", 4);
 
 	vmd->resources[resource_number] = (struct resource){
@@ -921,11 +921,6 @@ static void vmd_configure_membar(struct vmd_dev *vmd,
 static void vmd_configure_membar1_membar2(struct vmd_dev *vmd,
 					  resource_size_t membar2_offset)
 {
-	vmd_configure_membar(vmd, VMD_MEMBAR1, VMD_RESOURCE_MEMBAR1, 0, 0,
-			     NULL);
-	vmd_configure_membar(vmd, VMD_MEMBAR2, VMD_RESOURCE_MEMBAR2,
-			     membar2_offset, 0, NULL);
-
 	if (vmd_has_pch_rootbus(vmd)) {
 		u32 pch_membar1_offset = 0;
 		u64 pch_membar2_offset = 0;
@@ -945,18 +940,24 @@ static void vmd_configure_membar1_membar2(struct vmd_dev *vmd,
 		 * for PCH owned devices by adjusting range end with values
 		 * stored in PCI_MEMBAR1_OFFSET and PCI_MEMBAR2_OFFSET registers
 		 */
-		vmd_configure_membar(vmd, VMD_MEMBAR1, VMD_RESOURCE_MEMBAR1, 0,
+		vmd_configure_membar(vmd, VMD_RESOURCE_MEMBAR_1, VMD_MEMBAR1, 0,
 				     pch_membar1_offset, NULL);
-		vmd_configure_membar(vmd, VMD_MEMBAR2, VMD_RESOURCE_MEMBAR2,
+		vmd_configure_membar(vmd, VMD_RESOURCE_MEMBAR_2, VMD_MEMBAR2,
 				     membar2_offset,
 				     pch_membar2_offset - membar2_offset, NULL);
 
-		vmd_configure_membar(vmd, VMD_MEMBAR1, VMD_RESOURCE_PCH_MEMBAR1,
-				     pch_membar1_offset, 0,
-				     &vmd->resources[VMD_RESOURCE_MEMBAR1]);
-		vmd_configure_membar(vmd, VMD_MEMBAR2, VMD_RESOURCE_PCH_MEMBAR2,
+		vmd_configure_membar(vmd, VMD_RESOURCE_PCH_MEMBAR_1,
+				     VMD_MEMBAR1, pch_membar1_offset, 0,
+				     &vmd->resources[VMD_RESOURCE_MEMBAR_1]);
+		vmd_configure_membar(vmd, VMD_RESOURCE_PCH_MEMBAR_2,
+				     VMD_MEMBAR2,
 				     membar2_offset + pch_membar2_offset, 0,
-				     &vmd->resources[VMD_RESOURCE_MEMBAR2]);
+				     &vmd->resources[VMD_RESOURCE_MEMBAR_2]);
+	} else {
+		vmd_configure_membar(vmd, VMD_RESOURCE_MEMBAR_1, VMD_MEMBAR1, 0,
+				     0, NULL);
+		vmd_configure_membar(vmd, VMD_RESOURCE_MEMBAR_2, VMD_MEMBAR2,
+				     membar2_offset, 0, NULL);
 	}
 }
 
@@ -1018,17 +1019,17 @@ static int vmd_create_pch_bus(struct vmd_dev *vmd, struct pci_sysdata *sd,
 	pci_add_resource(&resources_pch,
 			 &vmd->resources[VMD_RESOURCE_PCH_CFGBAR]);
 	pci_add_resource_offset(&resources_pch,
-				&vmd->resources[VMD_RESOURCE_PCH_MEMBAR1],
+				&vmd->resources[VMD_RESOURCE_PCH_MEMBAR_1],
 				offset[0]);
 	pci_add_resource_offset(&resources_pch,
-				&vmd->resources[VMD_RESOURCE_PCH_MEMBAR2],
+				&vmd->resources[VMD_RESOURCE_PCH_MEMBAR_2],
 				offset[1]);
 
-	vmd->bus[VMD_ROOTBUS1] =
-		pci_create_root_bus(&vmd->dev->dev, vmd->busn_start[VMD_ROOTBUS1],
+	vmd->bus[VMD_ROOTBUS_1] =
+		pci_create_root_bus(&vmd->dev->dev, vmd->busn_start[VMD_ROOTBUS_1],
 					&vmd_ops, sd, &resources_pch);
 
-	if (!vmd->bus[VMD_ROOTBUS1]) {
+	if (!vmd->bus[VMD_ROOTBUS_1]) {
 		pci_free_resource_list(&resources_pch);
 		vmd_remove_irq_domain(vmd);
 		return -ENODEV;
@@ -1041,17 +1042,17 @@ static int vmd_create_pch_bus(struct vmd_dev *vmd, struct pci_sysdata *sd,
 	 * To avoid this, vmd->bus[VMD_ROOTBUS1]->number and
 	 * vmd->bus[VMD_ROOTBUS1]->primary are updated to same value.
 	 */
-	vmd->bus[VMD_ROOTBUS1]->primary = PCI_VMD_PRIMARY_PCH_BUS;
-	vmd->bus[VMD_ROOTBUS1]->number = PCI_VMD_PRIMARY_PCH_BUS;
+	vmd->bus[VMD_ROOTBUS_1]->primary = PCI_VMD_PRIMARY_PCH_BUS;
+	vmd->bus[VMD_ROOTBUS_1]->number = PCI_VMD_PRIMARY_PCH_BUS;
 
 	vmd_copy_host_bridge_flags(
 		pci_find_host_bridge(vmd->dev->bus),
-		to_pci_host_bridge(vmd->bus[VMD_ROOTBUS1]->bridge));
+		to_pci_host_bridge(vmd->bus[VMD_ROOTBUS_1]->bridge));
 
 	if (vmd->irq_domain)
-		dev_set_msi_domain(&vmd->bus[VMD_ROOTBUS1]->dev, vmd->irq_domain);
+		dev_set_msi_domain(&vmd->bus[VMD_ROOTBUS_1]->dev, vmd->irq_domain);
 	else
-		dev_set_msi_domain(&vmd->bus[VMD_ROOTBUS1]->dev,
+		dev_set_msi_domain(&vmd->bus[VMD_ROOTBUS_1]->dev,
 				dev_get_msi_domain(&vmd->dev->dev));
 
 	return 0;
@@ -1149,14 +1150,14 @@ static int vmd_enable_domain(struct vmd_dev *vmd, unsigned long features)
 
 	pci_add_resource(&resources, &vmd->resources[VMD_RESOURCE_CFGBAR]);
 	pci_add_resource_offset(
-		&resources, &vmd->resources[VMD_RESOURCE_MEMBAR1], offset[0]);
+		&resources, &vmd->resources[VMD_RESOURCE_MEMBAR_1], offset[0]);
 	pci_add_resource_offset(
-		&resources, &vmd->resources[VMD_RESOURCE_MEMBAR2], offset[1]);
+		&resources, &vmd->resources[VMD_RESOURCE_MEMBAR_2], offset[1]);
 
-	vmd->bus[VMD_ROOTBUS0] = pci_create_root_bus(
-		&vmd->dev->dev, vmd->busn_start[VMD_ROOTBUS0], &vmd_ops, sd,
+	vmd->bus[VMD_ROOTBUS_0] = pci_create_root_bus(
+		&vmd->dev->dev, vmd->busn_start[VMD_ROOTBUS_0], &vmd_ops, sd,
 		&resources);
-	if (!vmd->bus[VMD_ROOTBUS0]) {
+	if (!vmd->bus[VMD_ROOTBUS_0]) {
 		pci_free_resource_list(&resources);
 		vmd_remove_irq_domain(vmd);
 		return -ENODEV;
@@ -1164,21 +1165,21 @@ static int vmd_enable_domain(struct vmd_dev *vmd, unsigned long features)
 
 	vmd_copy_host_bridge_flags(
 		pci_find_host_bridge(vmd->dev->bus),
-		to_pci_host_bridge(vmd->bus[VMD_ROOTBUS0]->bridge));
+		to_pci_host_bridge(vmd->bus[VMD_ROOTBUS_0]->bridge));
 
 	vmd_attach_resources(vmd);
 	if (vmd->irq_domain)
-		dev_set_msi_domain(&vmd->bus[VMD_ROOTBUS0]->dev,
+		dev_set_msi_domain(&vmd->bus[VMD_ROOTBUS_0]->dev,
 				   vmd->irq_domain);
 	else
-		dev_set_msi_domain(&vmd->bus[VMD_ROOTBUS0]->dev,
+		dev_set_msi_domain(&vmd->bus[VMD_ROOTBUS_0]->dev,
 				   dev_get_msi_domain(&vmd->dev->dev));
 
 	WARN(sysfs_create_link(&vmd->dev->dev.kobj,
-			       &vmd->bus[VMD_ROOTBUS0]->dev.kobj, "domain"),
+			       &vmd->bus[VMD_ROOTBUS_0]->dev.kobj, "domain"),
 	     "Can't create symlink to domain\n");
 
-	vmd_bus_enumeration(vmd->bus[VMD_ROOTBUS0], features);
+	vmd_bus_enumeration(vmd->bus[VMD_ROOTBUS_0], features);
 
 	if (vmd_has_pch_rootbus(vmd)) {
 		ret = vmd_create_pch_bus(vmd, sd, offset);
@@ -1187,7 +1188,7 @@ static int vmd_enable_domain(struct vmd_dev *vmd, unsigned long features)
 			return ret;
 		}
 
-		vmd_bus_enumeration(vmd->bus[VMD_ROOTBUS1], features);
+		vmd_bus_enumeration(vmd->bus[VMD_ROOTBUS_1], features);
 	}
 
 	return 0;
@@ -1265,12 +1266,12 @@ static void vmd_remove(struct pci_dev *dev)
 {
 	struct vmd_dev *vmd = pci_get_drvdata(dev);
 
-	pci_stop_root_bus(vmd->bus[VMD_ROOTBUS0]);
+	pci_stop_root_bus(vmd->bus[VMD_ROOTBUS_0]);
 	sysfs_remove_link(&vmd->dev->dev.kobj, "domain");
-	pci_remove_root_bus(vmd->bus[VMD_ROOTBUS0]);
+	pci_remove_root_bus(vmd->bus[VMD_ROOTBUS_0]);
 	if (vmd_has_pch_rootbus(vmd)) {
-		pci_stop_root_bus(vmd->bus[VMD_ROOTBUS1]);
-		pci_remove_root_bus(vmd->bus[VMD_ROOTBUS1]);
+		pci_stop_root_bus(vmd->bus[VMD_ROOTBUS_1]);
+		pci_remove_root_bus(vmd->bus[VMD_ROOTBUS_1]);
 	}
 	vmd_cleanup_srcu(vmd);
 	vmd_detach_resources(vmd);
