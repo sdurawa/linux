@@ -31,12 +31,12 @@
 #define PCI_REG_VMLOCK		0x70
 #define MB2_SHADOW_EN(vmlock)	(vmlock & 0x2)
 
-#define PCI_VMD_PRIMARY_PCH_BUS 0x80
-#define PCI_REG_BUSRANGE0 0xC8
-#define PCI_REG_BUSRANGE1 0xCC
-#define PCI_MEMBAR1_OFFSET 0xD0
-#define PCI_MEMBAR2_OFFSET1 0xD8
-#define PCI_MEMBAR2_OFFSET2 0xDC
+#define VMD_PRIMARY_PCH_BUS 0x80
+#define VMD_REG_BUSRANGE0 0xC8
+#define VMD_REG_BUSRANGE1 0xCC
+#define VMD_MEMBAR1_OFFSET 0xD0
+#define VMD_MEMBAR2_OFFSET1 0xD8
+#define VMD_MEMBAR2_OFFSET2 0xDC
 #define VMD_ROOTBUS_RANGE_END(busr) ((busr >> 8) & 0xff)
 #define VMD_ROOTBUS_RANGE_START(busr) (busr & 0x00ff)
 
@@ -44,7 +44,7 @@
 #define MB2_SHADOW_SIZE		16
 
 enum vmd_resource {
-	VMD_RESOURCE_CFGBAR,
+	VMD_RESOURCE_CFGBAR = 0,
 	VMD_RESOURCE_MEMBAR_1,
 	VMD_RESOURCE_MEMBAR_2,
 	VMD_RESOURCE_PCH_CFGBAR,
@@ -54,7 +54,7 @@ enum vmd_resource {
 };
 
 enum vmd_rootbus {
-	VMD_ROOTBUS_0,
+	VMD_ROOTBUS_0 = 0,
 	VMD_ROOTBUS_1,
 	VMD_ROOTBUS_COUNT
 };
@@ -112,7 +112,7 @@ enum vmd_features {
 #define VMD_FEATS_CLIENT	(VMD_FEAT_HAS_MEMBAR_SHADOW_VSCAP |	\
 				 VMD_FEAT_HAS_BUS_RESTRICTIONS |	\
 				 VMD_FEAT_OFFSET_FIRST_VECTOR |		\
-				 VMD_FEAT_BIOS_PM_QUIRK |	\
+				 VMD_FEAT_BIOS_PM_QUIRK |		\
 				 VMD_FEAT_HAS_PCH_ROOTBUS)
 
 static DEFINE_IDA(vmd_instance_ida);
@@ -413,7 +413,7 @@ static void __iomem *vmd_cfg_addr(struct vmd_dev *vmd, struct pci_bus *bus,
 	 * (see comment in vmd_create_pch_bus()) but original value is 0xE1
 	 * which is stored in vmd->busn_start[VMD_ROOTBUS_1].
 	 */
-	bus_number = (bus->number == PCI_VMD_PRIMARY_PCH_BUS) ?
+	bus_number = (bus->number == VMD_PRIMARY_PCH_BUS) ?
 			     vmd->busn_start[VMD_ROOTBUS_1] : bus->number;
 
 	busnr_ecam = bus_number - vmd->busn_start[VMD_ROOTBUS_0];
@@ -702,19 +702,17 @@ static int vmd_get_bus_number_start(struct vmd_dev *vmd, unsigned long features)
 			vmd->busn_start[VMD_ROOTBUS_0] = 224;
 			break;
 		case 3:
-			if (features & VMD_FEAT_HAS_PCH_ROOTBUS) {
-				/* IOC start bus */
-				vmd->busn_start[VMD_ROOTBUS_0] = 224;
-				/* PCH start bus */
-				vmd->busn_start[VMD_ROOTBUS_1] = 225;
-			} else {
+			if (!(features & VMD_FEAT_HAS_PCH_ROOTBUS)) {
 				pci_err(dev,
-					"VMD Bus Restriction detected type %d,",
+					"VMD Bus Restriction detected type %d, but PCH Rootbus is not supported, aborting.\n",
 					BUS_RESTRICT_CFG(reg));
-				pci_err(dev,
-					"but PCH Rootbus is not supported, aborting.\n");
 				return -ENXIO;
 			}
+
+			/* IOC start bus */
+			vmd->busn_start[VMD_ROOTBUS_0] = 224;
+			/* PCH start bus */
+			vmd->busn_start[VMD_ROOTBUS_1] = 225;
 			break;
 		default:
 			pci_err(dev, "Unknown Bus Offset Setting (%d)\n",
@@ -847,9 +845,9 @@ static void vmd_configure_cfgbar(struct vmd_dev *vmd)
 	};
 
 	if (vmd_has_pch_rootbus(vmd)) {
-		pci_read_config_word(vmd->dev, PCI_REG_BUSRANGE0,
+		pci_read_config_word(vmd->dev, VMD_REG_BUSRANGE0,
 				     &ioc_bus_range);
-		pci_read_config_word(vmd->dev, PCI_REG_BUSRANGE1,
+		pci_read_config_word(vmd->dev, VMD_REG_BUSRANGE1,
 				     &pch_bus_range);
 
 		/*
@@ -901,13 +899,11 @@ static void vmd_configure_membar(struct vmd_dev *vmd,
 	if (!upper_bits)
 		flags &= ~IORESOURCE_MEM_64;
 
-	snprintf(name, sizeof(name), "VMD MEMBAR%d", membar_number/2);
+	snprintf(name, sizeof(name), "VMD MEMBAR%d %s", membar_number / 2,
+		 resource_number > VMD_RESOURCE_MEMBAR_2 ? "PCH" : "");
 
 	if (!parent)
 		parent = res;
-
-	if (resource_number > VMD_RESOURCE_MEMBAR_2)
-		strncat(name, " PCH", 4);
 
 	vmd->resources[resource_number] = (struct resource){
 		.name = name,
@@ -926,13 +922,13 @@ static void vmd_configure_membar1_membar2(struct vmd_dev *vmd,
 		u64 pch_membar2_offset = 0;
 		u32 reg;
 
-		pci_read_config_dword(vmd->dev, PCI_MEMBAR1_OFFSET,
-				      &pch_membar1_offset);
+		pci_read_config_dword(vmd->dev, VMD_MEMBAR1_OFFSET,
+							  &pch_membar1_offset);
 
-		pci_read_config_dword(vmd->dev, PCI_MEMBAR2_OFFSET1, &reg);
+		pci_read_config_dword(vmd->dev, VMD_MEMBAR2_OFFSET1, &reg);
 		pch_membar2_offset = reg;
 
-		pci_read_config_dword(vmd->dev, PCI_MEMBAR2_OFFSET2, &reg);
+		pci_read_config_dword(vmd->dev, VMD_MEMBAR2_OFFSET2, &reg);
 		pch_membar2_offset |= (u64)reg << 32;
 
 		/*
@@ -941,23 +937,23 @@ static void vmd_configure_membar1_membar2(struct vmd_dev *vmd,
 		 * stored in PCI_MEMBAR1_OFFSET and PCI_MEMBAR2_OFFSET registers
 		 */
 		vmd_configure_membar(vmd, VMD_RESOURCE_MEMBAR_1, VMD_MEMBAR1, 0,
-				     pch_membar1_offset, NULL);
+							 pch_membar1_offset, NULL);
 		vmd_configure_membar(vmd, VMD_RESOURCE_MEMBAR_2, VMD_MEMBAR2,
-				     membar2_offset,
-				     pch_membar2_offset - membar2_offset, NULL);
+							 membar2_offset,
+							 pch_membar2_offset - membar2_offset, NULL);
 
 		vmd_configure_membar(vmd, VMD_RESOURCE_PCH_MEMBAR_1,
-				     VMD_MEMBAR1, pch_membar1_offset, 0,
-				     &vmd->resources[VMD_RESOURCE_MEMBAR_1]);
+							 VMD_MEMBAR1, pch_membar1_offset, 0,
+							 &vmd->resources[VMD_RESOURCE_MEMBAR_1]);
 		vmd_configure_membar(vmd, VMD_RESOURCE_PCH_MEMBAR_2,
-				     VMD_MEMBAR2,
-				     membar2_offset + pch_membar2_offset, 0,
-				     &vmd->resources[VMD_RESOURCE_MEMBAR_2]);
+							 VMD_MEMBAR2,
+							 membar2_offset + pch_membar2_offset, 0,
+							 &vmd->resources[VMD_RESOURCE_MEMBAR_2]);
 	} else {
 		vmd_configure_membar(vmd, VMD_RESOURCE_MEMBAR_1, VMD_MEMBAR1, 0,
-				     0, NULL);
+							 0, NULL);
 		vmd_configure_membar(vmd, VMD_RESOURCE_MEMBAR_2, VMD_MEMBAR2,
-				     membar2_offset, 0, NULL);
+							 membar2_offset, 0, NULL);
 	}
 }
 
@@ -1017,21 +1013,22 @@ static int vmd_create_pch_bus(struct vmd_dev *vmd, struct pci_sysdata *sd,
 	LIST_HEAD(resources_pch);
 
 	pci_add_resource(&resources_pch,
-			 &vmd->resources[VMD_RESOURCE_PCH_CFGBAR]);
+					 &vmd->resources[VMD_RESOURCE_PCH_CFGBAR]);
 	pci_add_resource_offset(&resources_pch,
-				&vmd->resources[VMD_RESOURCE_PCH_MEMBAR_1],
-				offset[0]);
+							&vmd->resources[VMD_RESOURCE_PCH_MEMBAR_1],
+							offset[0]);
 	pci_add_resource_offset(&resources_pch,
-				&vmd->resources[VMD_RESOURCE_PCH_MEMBAR_2],
-				offset[1]);
+							&vmd->resources[VMD_RESOURCE_PCH_MEMBAR_2],
+							offset[1]);
 
 	vmd->bus[VMD_ROOTBUS_1] =
 		pci_create_root_bus(&vmd->dev->dev, vmd->busn_start[VMD_ROOTBUS_1],
-					&vmd_ops, sd, &resources_pch);
+							&vmd_ops, sd, &resources_pch);
 
 	if (!vmd->bus[VMD_ROOTBUS_1]) {
 		pci_free_resource_list(&resources_pch);
-		vmd_remove_irq_domain(vmd);
+		pci_stop_root_bus(vmd->bus[VMD_ROOTBUS_1]);
+		pci_remove_root_bus(vmd->bus[VMD_ROOTBUS_1]);
 		return -ENODEV;
 	}
 
@@ -1042,8 +1039,8 @@ static int vmd_create_pch_bus(struct vmd_dev *vmd, struct pci_sysdata *sd,
 	 * To avoid this, vmd->bus[VMD_ROOTBUS1]->number and
 	 * vmd->bus[VMD_ROOTBUS1]->primary are updated to same value.
 	 */
-	vmd->bus[VMD_ROOTBUS_1]->primary = PCI_VMD_PRIMARY_PCH_BUS;
-	vmd->bus[VMD_ROOTBUS_1]->number = PCI_VMD_PRIMARY_PCH_BUS;
+	vmd->bus[VMD_ROOTBUS_1]->primary = VMD_PRIMARY_PCH_BUS;
+	vmd->bus[VMD_ROOTBUS_1]->number = VMD_PRIMARY_PCH_BUS;
 
 	vmd_copy_host_bridge_flags(
 		pci_find_host_bridge(vmd->dev->bus),
@@ -1358,4 +1355,4 @@ module_pci_driver(vmd_drv);
 MODULE_AUTHOR("Intel Corporation");
 MODULE_DESCRIPTION("Volume Management Device driver");
 MODULE_LICENSE("GPL v2");
-MODULE_VERSION("0.6");
+MODULE_VERSION("0.7");
