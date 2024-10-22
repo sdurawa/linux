@@ -404,8 +404,21 @@ static inline u8 vmd_has_pch_rootbus(struct vmd_dev *vmd)
 static void __iomem *vmd_cfg_addr(struct vmd_dev *vmd, struct pci_bus *bus,
 				  unsigned int devfn, int reg, int len)
 {
-	unsigned int busnr_ecam = bus->number - vmd->busn_start[VMD_ROOTBUS_0];
-	u32 offset = PCIE_ECAM_OFFSET(busnr_ecam, devfn, reg);
+	unsigned char bus_number;
+	unsigned int busnr_ecam;
+	u32 offset;
+
+	/*
+	 * VMD WA: for PCH rootbus, bus number is set to PCI_VMD_PRIMARY_PCH_BUS
+	 * (see comment in vmd_create_pch_bus()) but original value is 0xE1
+	 * which is stored in vmd->busn_start[VMD_ROOTBUS_1].
+	 */
+	bus_number = (bus->number == VMD_PRIMARY_PCH_BUS) ?
+			     vmd->busn_start[VMD_ROOTBUS_1] :
+			     bus->number;
+
+	busnr_ecam = bus_number - vmd->busn_start[VMD_ROOTBUS_0];
+	offset = PCIE_ECAM_OFFSET(busnr_ecam, devfn, reg);
 
 	if (offset + len >= resource_size(&vmd->dev->resource[VMD_CFGBAR]))
 		return NULL;
@@ -1018,6 +1031,14 @@ static int vmd_create_pch_bus(struct vmd_dev *vmd, struct pci_sysdata *sd,
 		return -ENODEV;
 	}
 
+	/*
+	 * This is a workaround for pci_scan_bridge_extend() code.
+	 * It assigns setup as broken when primary != bus->number and
+	 * for PCH rootbus primary is not "hard-wired to 0".
+	 * To avoid this, vmd->bus[VMD_ROOTBUS1]->number and
+	 * vmd->bus[VMD_ROOTBUS1]->primary are updated to the same value.
+	 */
+	vmd->bus[VMD_ROOTBUS_1]->number = VMD_PRIMARY_PCH_BUS;
 	vmd->bus[VMD_ROOTBUS_1]->primary = VMD_PRIMARY_PCH_BUS;
 
 	vmd_copy_host_bridge_flags(
